@@ -1,0 +1,1998 @@
+<?php
+/**
+ * database.php - Файловая база данных в PHP
+ * Версия: 4.1 - Исправлен путь к API интеграции 1С
+ * ✅ Сохранена вся функциональность v4.0
+ */
+
+class Database {
+    private $dataPath;
+    private $cache = [];
+    private $schemas = []; // Новое: схемы таблиц
+    private $relations = []; // Новое: связи между таблицами
+
+    public function __construct($dataPath = null) {
+        // ✅ Используем абсолютный путь
+        if ($dataPath === null) {
+            $dataPath = __DIR__ . '/data/';
+        }
+
+        // Нормализуем путь (убираем двойные слэши, добавляем завершающий слэш)
+        $dataPath = rtrim($dataPath, '/') . '/';
+
+        $this->dataPath = $dataPath;
+        $this->initDirectories();
+        $this->initSchemas(); // Новое
+        $this->initRelations(); // Новое
+
+        // Логируем путь для отладки
+        $this->log("Database initialized with path: {$this->dataPath}", 'info');
+    }
+
+    private function initDirectories() {
+        $dirs = [
+            'products', 
+            'orders', 
+            'customers', 
+            'categories', 
+            '1c_exchange', 
+            'settings', 
+            'logs', 
+            'users', 
+            'cart', 
+            'delivery_zones', 
+            'delivery_slots',
+            'payment_transactions',
+            'payment_settings',
+            'bonus_history',
+            'notifications',
+            'promocodes',
+            'reviews',
+            'wishlists',
+            'exports/1c/orders',
+            'exports/1c/customers',
+            'exports/1c/products',
+            'locks' // Новое: для атомарных операций
+        ];
+
+        foreach ($dirs as $dir) {
+            $fullPath = $this->dataPath . $dir;
+            if (!file_exists($fullPath)) {
+                if (!mkdir($fullPath, 0777, true)) {
+                    throw new Exception("Failed to create directory: {$fullPath}");
+                }
+            }
+
+            // Проверка прав на запись
+            if (!is_writable($fullPath)) {
+                @chmod($fullPath, 0777);
+                if (!is_writable($fullPath)) {
+                    throw new Exception("Directory not writable: {$fullPath}");
+                }
+            }
+        }
+    }
+
+    // ============= НОВОЕ: СХЕМЫ ТАБЛИЦ =============
+
+    /**
+     * Инициализация схем таблиц (валидация данных)
+     */
+    private function initSchemas() {
+        $this->schemas = [
+            'products' => [
+                'name' => ['type' => 'string', 'required' => true, 'max' => 255],
+                'description' => ['type' => 'string'],
+                'price' => ['type' => 'float', 'required' => true, 'min' => 0],
+                'old_price' => ['type' => 'float', 'min' => 0],
+                'category_id' => ['type' => 'int', 'foreign_key' => 'categories'],
+                'sku' => ['type' => 'string', 'max' => 100],
+                'external_id' => ['type' => 'string', 'max' => 100],
+                'stock' => ['type' => 'int', 'min' => 0, 'default' => 0],
+                'weight' => ['type' => 'float', 'min' => 0],
+                'is_new' => ['type' => 'bool', 'default' => false],
+                'is_popular' => ['type' => 'bool', 'default' => false],
+                'status' => ['type' => 'enum', 'values' => ['active', 'inactive', 'draft'], 'default' => 'active']
+            ],
+            'orders' => [
+                'order_number' => ['type' => 'string', 'required' => true],
+                'customer_id' => ['type' => 'int', 'foreign_key' => 'customers'],
+                'customer_name' => ['type' => 'string', 'required' => true],
+                'customer_phone' => ['type' => 'string', 'required' => true],
+                'customer_email' => ['type' => 'string', 'email' => true],
+                'total' => ['type' => 'float', 'required' => true, 'min' => 0],
+                'subtotal' => ['type' => 'float', 'min' => 0],
+                'delivery_cost' => ['type' => 'float', 'min' => 0],
+                'discount' => ['type' => 'float', 'min' => 0],
+                'payment_method' => ['type' => 'enum', 'values' => ['cash', 'card', 'online'], 'default' => 'cash'],
+                'payment_status' => ['type' => 'enum', 'values' => ['pending', 'paid', 'failed', 'refunded'], 'default' => 'pending'],
+                'status' => ['type' => 'enum', 'values' => ['new', 'confirmed', 'preparing', 'delivery', 'completed', 'cancelled'], 'default' => 'new'],
+                'delivery_type' => ['type' => 'enum', 'values' => ['delivery', 'pickup'], 'default' => 'delivery']
+            ],
+            'customers' => [
+                'name' => ['type' => 'string', 'required' => true],
+                'phone' => ['type' => 'string', 'required' => true, 'unique' => true],
+                'email' => ['type' => 'string', 'email' => true, 'unique' => true],
+                'bonus_balance' => ['type' => 'float', 'min' => 0, 'default' => 0],
+                'external_id' => ['type' => 'string'],
+                'status' => ['type' => 'enum', 'values' => ['active', 'blocked'], 'default' => 'active']
+            ],
+            'categories' => [
+                'name' => ['type' => 'string', 'required' => true],
+                'slug' => ['type' => 'string', 'required' => true, 'unique' => true],
+                'description' => ['type' => 'string'],
+                'sort_order' => ['type' => 'int', 'min' => 0, 'default' => 0],
+                'status' => ['type' => 'enum', 'values' => ['active', 'inactive'], 'default' => 'active']
+            ],
+            'delivery_zones' => [
+                'name' => ['type' => 'string', 'required' => true],
+                'delivery_cost' => ['type' => 'float', 'min' => 0, 'default' => 0],
+                'min_order' => ['type' => 'float', 'min' => 0, 'default' => 0],
+                'delivery_time' => ['type' => 'string'],
+                'external_id' => ['type' => 'string'],
+                'status' => ['type' => 'enum', 'values' => ['active', 'inactive'], 'default' => 'active']
+            ]
+        ];
+    }
+
+    /**
+     * Инициализация связей между таблицами
+     */
+    private function initRelations() {
+        $this->relations = [
+            'products' => [
+                'category' => ['table' => 'categories', 'foreign_key' => 'category_id', 'type' => 'belongsTo']
+            ],
+            'orders' => [
+                'customer' => ['table' => 'customers', 'foreign_key' => 'customer_id', 'type' => 'belongsTo']
+            ],
+            'customers' => [
+                'orders' => ['table' => 'orders', 'foreign_key' => 'customer_id', 'type' => 'hasMany']
+            ],
+            'categories' => [
+                'products' => ['table' => 'products', 'foreign_key' => 'category_id', 'type' => 'hasMany']
+            ]
+        ];
+    }
+
+    // ============= НОВОЕ: ВАЛИДАЦИЯ =============
+
+    /**
+     * Валидация данных перед сохранением
+     */
+    private function validate($table, $data, $isUpdate = false) {
+        if (!isset($this->schemas[$table])) {
+            return ['valid' => true]; // Если схемы нет - пропускаем валидацию
+        }
+
+        $schema = $this->schemas[$table];
+        $errors = [];
+
+        foreach ($schema as $field => $rules) {
+            $value = $data[$field] ?? null;
+
+            // Проверка обязательных полей
+            if (!$isUpdate && isset($rules['required']) && $rules['required'] && empty($value) && $value !== 0 && $value !== '0') {
+                $errors[$field] = "Field '{$field}' is required";
+                continue;
+            }
+
+            // Если поле не задано и не обязательное - пропускаем
+            if ($value === null || $value === '') {
+                continue;
+            }
+
+            // Проверка типа
+            if (isset($rules['type'])) {
+                switch ($rules['type']) {
+                    case 'string':
+                        if (!is_string($value)) {
+                            $errors[$field] = "Field '{$field}' must be a string";
+                        } elseif (isset($rules['max']) && mb_strlen($value) > $rules['max']) {
+                            $errors[$field] = "Field '{$field}' must be less than {$rules['max']} characters";
+                        }
+                        break;
+
+                    case 'int':
+                        if (!is_numeric($value)) {
+                            $errors[$field] = "Field '{$field}' must be an integer";
+                        } elseif (isset($rules['min']) && $value < $rules['min']) {
+                            $errors[$field] = "Field '{$field}' must be at least {$rules['min']}";
+                        }
+                        break;
+
+                    case 'float':
+                        if (!is_numeric($value)) {
+                            $errors[$field] = "Field '{$field}' must be a number";
+                        } elseif (isset($rules['min']) && $value < $rules['min']) {
+                            $errors[$field] = "Field '{$field}' must be at least {$rules['min']}";
+                        }
+                        break;
+
+                    case 'bool':
+                        if (!is_bool($value) && $value !== 0 && $value !== 1 && $value !== '0' && $value !== '1') {
+                            $errors[$field] = "Field '{$field}' must be boolean";
+                        }
+                        break;
+
+                    case 'enum':
+                        if (isset($rules['values']) && !in_array($value, $rules['values'])) {
+                            $errors[$field] = "Field '{$field}' must be one of: " . implode(', ', $rules['values']);
+                        }
+                        break;
+                }
+            }
+
+            // Проверка email
+            if (isset($rules['email']) && $rules['email'] && !filter_var($value, FILTER_VALIDATE_EMAIL)) {
+                $errors[$field] = "Field '{$field}' must be a valid email";
+            }
+
+            // Проверка foreign key
+            if (isset($rules['foreign_key']) && $value) {
+                $relatedTable = $rules['foreign_key'];
+                if (!$this->exists($relatedTable, $value)) {
+                    $errors[$field] = "Related record in '{$relatedTable}' with ID {$value} not found";
+                }
+            }
+
+            // Проверка уникальности
+            if (isset($rules['unique']) && $rules['unique']) {
+                $existing = $this->findBy($table, $field, $value);
+                if ($existing && (!$isUpdate || $existing['id'] !== $data['id'])) {
+                    $errors[$field] = "Field '{$field}' must be unique. Value '{$value}' already exists";
+                }
+            }
+        }
+
+        return [
+            'valid' => empty($errors),
+            'errors' => $errors
+        ];
+    }
+
+    /**
+     * Применение значений по умолчанию
+     */
+    private function applyDefaults($table, $data) {
+        if (!isset($this->schemas[$table])) {
+            return $data;
+        }
+
+        $schema = $this->schemas[$table];
+
+        foreach ($schema as $field => $rules) {
+            if (!isset($data[$field]) && isset($rules['default'])) {
+                $data[$field] = $rules['default'];
+            }
+        }
+
+        return $data;
+    }
+
+    // ============= НОВОЕ: СВЯЗИ (RELATIONS) =============
+
+    /**
+     * Загрузка данных со связями
+     */
+    public function findWithRelations($table, $id, $relations = []) {
+        $data = $this->find($table, $id);
+
+        if (!$data || empty($relations)) {
+            return $data;
+        }
+
+        $availableRelations = $this->relations[$table] ?? [];
+
+        foreach ($relations as $relationName) {
+            if (!isset($availableRelations[$relationName])) {
+                continue;
+            }
+
+            $relation = $availableRelations[$relationName];
+
+            if ($relation['type'] === 'belongsTo') {
+                // Загружаем связанную запись (один к одному)
+                $foreignKey = $relation['foreign_key'];
+                if (isset($data[$foreignKey]) && $data[$foreignKey]) {
+                    $data[$relationName] = $this->find($relation['table'], $data[$foreignKey]);
+                }
+            } elseif ($relation['type'] === 'hasMany') {
+                // Загружаем связанные записи (один ко многим)
+                $foreignKey = $relation['foreign_key'];
+                $data[$relationName] = $this->findAll($relation['table'], [$foreignKey => $data['id']]);
+            }
+        }
+
+        return $data;
+    }
+
+    /**
+     * Загрузка всех записей со связями
+     */
+    public function findAllWithRelations($table, $relations = [], $filter = [], $limit = null) {
+        $items = $this->findAll($table, $filter, $limit);
+
+        if (empty($relations)) {
+            return $items;
+        }
+
+        foreach ($items as &$item) {
+            $item = $this->loadRelationsForItem($table, $item, $relations);
+        }
+
+        return $items;
+    }
+
+    /**
+     * Вспомогательный метод для загрузки связей
+     */
+    private function loadRelationsForItem($table, $item, $relations) {
+        $availableRelations = $this->relations[$table] ?? [];
+
+        foreach ($relations as $relationName) {
+            if (!isset($availableRelations[$relationName])) {
+                continue;
+            }
+
+            $relation = $availableRelations[$relationName];
+
+            if ($relation['type'] === 'belongsTo') {
+                $foreignKey = $relation['foreign_key'];
+                if (isset($item[$foreignKey]) && $item[$foreignKey]) {
+                    $item[$relationName] = $this->find($relation['table'], $item[$foreignKey]);
+                }
+            } elseif ($relation['type'] === 'hasMany') {
+                $foreignKey = $relation['foreign_key'];
+                $item[$relationName] = $this->findAll($relation['table'], [$foreignKey => $item['id']]);
+            }
+        }
+
+        return $item;
+    }
+
+    // ============= НОВОЕ: АТОМАРНЫЕ ОПЕРАЦИИ =============
+
+    /**
+     * Атомарное увеличение значения поля
+     */
+    public function increment($table, $id, $field, $value = 1) {
+        return $this->atomicOperation($table, $id, function($data) use ($field, $value) {
+            $data[$field] = ($data[$field] ?? 0) + $value;
+            return $data;
+        });
+    }
+
+    /**
+     * Атомарное уменьшение значения поля
+     */
+    public function decrement($table, $id, $field, $value = 1) {
+        return $this->atomicOperation($table, $id, function($data) use ($field, $value) {
+            $data[$field] = ($data[$field] ?? 0) - $value;
+            return $data;
+        });
+    }
+
+    /**
+     * Выполнение атомарной операции с блокировкой
+     */
+    public function atomicOperation($table, $id, $callback) {
+        $lockFile = $this->dataPath . 'locks/' . $table . '_' . $id . '.lock';
+
+        // Создаем файл блокировки
+        $fp = @fopen($lockFile, 'c');
+        if (!$fp) {
+            throw new Exception("Cannot create lock file: {$lockFile}");
+        }
+
+        // Получаем эксклюзивную блокировку
+        if (!flock($fp, LOCK_EX)) {
+            fclose($fp);
+            throw new Exception("Cannot acquire lock for {$table}:{$id}");
+        }
+
+        try {
+            // Читаем данные
+            $data = $this->find($table, $id);
+
+            if (!$data) {
+                throw new Exception("Record not found: {$table}:{$id}");
+            }
+
+            // Применяем изменения
+            $data = $callback($data);
+
+            // Сохраняем
+            $this->save($table, $data, $id);
+
+            // Освобождаем блокировку
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            @unlink($lockFile);
+
+            return $data;
+        } catch (Exception $e) {
+            // В случае ошибки освобождаем блокировку
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            @unlink($lockFile);
+            throw $e;
+        }
+    }
+
+    // ============= НОВОЕ: ОПТИМИЗИРОВАННЫЙ ПОИСК =============
+
+    /**
+     * Оптимизированный поиск через индекс (для простых фильтров)
+     */
+    public function findAllOptimized($table, $filter = [], $limit = null, $offset = 0) {
+        // Если фильтр пустой или сложный - используем стандартный метод
+        if (empty($filter) || count($filter) > 2) {
+            return $this->findAll($table, $filter, $limit, $offset);
+        }
+
+        // Пробуем использовать индекс
+        $index = $this->getIndex($table);
+
+        if (empty($index)) {
+            return $this->findAll($table, $filter, $limit, $offset);
+        }
+
+        // Фильтруем индекс
+        $matchingIds = [];
+        foreach ($index as $id => $indexEntry) {
+            $matches = true;
+            foreach ($filter as $key => $value) {
+                if (!isset($indexEntry[$key]) || $indexEntry[$key] != $value) {
+                    $matches = false;
+                    break;
+                }
+            }
+            if ($matches) {
+                $matchingIds[] = $id;
+            }
+        }
+
+        // Применяем offset и limit к ID
+        $matchingIds = array_slice($matchingIds, $offset, $limit);
+
+        // Загружаем только нужные записи
+        $results = [];
+        foreach ($matchingIds as $id) {
+            $data = $this->find($table, $id);
+            if ($data) {
+                $results[] = $data;
+            }
+        }
+
+        return $results;
+    }
+
+    // ============= НОВОЕ: BULK ОПЕРАЦИИ =============
+
+    /**
+     * Массовая вставка записей
+     */
+    public function bulkInsert($table, $items) {
+        $inserted = [];
+        $errors = [];
+
+        foreach ($items as $index => $item) {
+            try {
+                $id = $this->save($table, $item);
+                $inserted[] = $id;
+            } catch (Exception $e) {
+                $errors[$index] = $e->getMessage();
+            }
+        }
+
+        return [
+            'inserted' => $inserted,
+            'errors' => $errors,
+            'total' => count($inserted),
+            'failed' => count($errors)
+        ];
+    }
+
+    /**
+     * Массовое обновление записей
+     */
+    public function bulkUpdate($table, $filter, $updates) {
+        $items = $this->findAll($table, $filter);
+        $updated = 0;
+
+        foreach ($items as $item) {
+            $item = array_merge($item, $updates);
+            $this->save($table, $item, $item['id']);
+            $updated++;
+        }
+
+        return $updated;
+    }
+
+    // ============= УЛУЧШЕННОЕ СОХРАНЕНИЕ С ВАЛИДАЦИЕЙ =============
+
+    /**
+     * Безопасное преобразование в целое число
+     */
+    private function toInt($value, $default = 0) {
+        if (is_numeric($value)) {
+            return intval($value);
+        }
+        return $default;
+    }
+
+    /**
+     * Безопасное преобразование в float
+     */
+    private function toFloat($value, $default = 0.0) {
+        if (is_numeric($value)) {
+            return floatval($value);
+        }
+        return $default;
+    }
+
+    /**
+     * Сохранение данных - УЛУЧШЕНО с валидацией v4.1
+     */
+    public function save($table, $data, $id = null) {
+        // ===== ШАГ 0: ВАЛИДАЦИЯ (НОВОЕ) =====
+        $isUpdate = ($id !== null) || isset($data['id']);
+
+        // Применяем значения по умолчанию
+        $data = $this->applyDefaults($table, $data);
+
+        // Валидация
+        $validation = $this->validate($table, $data, $isUpdate);
+        if (!$validation['valid']) {
+            $errorMsg = "Validation failed for {$table}: " . json_encode($validation['errors']);
+            $this->log($errorMsg, 'error');
+            throw new Exception($errorMsg);
+        }
+
+        // ===== ШАГ 1: Определяем ID и проверяем существование =====
+        if ($id === null && !isset($data['id'])) {
+            // Генерируем новый ID
+            $id = $this->generateId($table);
+            $data['id'] = $id;
+            $isNew = true;
+        } elseif ($id === null && isset($data['id'])) {
+            // Используем ID из данных
+            $id = $data['id'];
+            $filePath = $this->dataPath . $table . '/' . $id . '.json';
+            $isNew = !file_exists($filePath);
+        } else {
+            // Используем переданный ID
+            $data['id'] = $id;
+            $filePath = $this->dataPath . $table . '/' . $id . '.json';
+            $isNew = !file_exists($filePath);
+        }
+
+        // ===== ШАГ 2: Временные метки =====
+        $data['updated_at'] = date('Y-m-d H:i:s');
+
+        if ($isNew) {
+            // Для новых записей всегда создаём created_at
+            $data['created_at'] = date('Y-m-d H:i:s');
+        } else {
+            // Для обновления пытаемся сохранить старый created_at
+            if (!isset($data['created_at'])) {
+                $existing = $this->find($table, $id);
+                if ($existing && isset($existing['created_at'])) {
+                    $data['created_at'] = $existing['created_at'];
+                } else {
+                    $data['created_at'] = date('Y-m-d H:i:s');
+                }
+            }
+        }
+
+        // ===== ШАГ 3: Формируем путь =====
+        $dir = $this->dataPath . $table;
+
+        // Проверяем существование директории
+        if (!is_dir($dir)) {
+            if (!mkdir($dir, 0777, true)) {
+                throw new Exception("Failed to create directory: {$dir}");
+            }
+        }
+
+        $filePath = $dir . '/' . $id . '.json';
+
+        // ===== ШАГ 4: Сохраняем файл =====
+        $jsonData = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+
+        if ($jsonData === false) {
+            throw new Exception("Failed to encode JSON: " . json_last_error_msg());
+        }
+
+        // Пытаемся записать с повторами
+        $attempts = 3;
+        $result = false;
+
+        for ($i = 0; $i < $attempts; $i++) {
+            $result = @file_put_contents($filePath, $jsonData, LOCK_EX);
+            if ($result !== false) {
+                break;
+            }
+            usleep(100000); // 0.1 секунды
+        }
+
+        if ($result === false) {
+            $error = error_get_last();
+            throw new Exception("Failed to write file: {$filePath}. Error: " . ($error['message'] ?? 'Unknown'));
+        }
+
+        // ===== ШАГ 5: Проверяем что файл записался корректно =====
+        clearstatcache(true, $filePath);
+
+        if (!file_exists($filePath)) {
+            throw new Exception("File was not created: {$filePath}");
+        }
+
+        $filesize = filesize($filePath);
+        if ($filesize === false || $filesize === 0) {
+            throw new Exception("File is empty: {$filePath}");
+        }
+
+        // Проверяем что файл читается
+        $verification = @file_get_contents($filePath);
+        if ($verification === false || empty($verification)) {
+            throw new Exception("File verification failed (cannot read): {$filePath}");
+        }
+
+        // Проверяем что JSON валидный
+        $verifyData = json_decode($verification, true);
+        if ($verifyData === null && json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception("File verification failed (invalid JSON): {$filePath}");
+        }
+
+        // ===== ШАГ 6: Обновляем индекс =====
+        $this->updateIndex($table, $id, $data);
+
+        // ===== ШАГ 7: Сбрасываем кэш =====
+        unset($this->cache[$table . '_all']);
+
+        // ===== ШАГ 8: Логируем =====
+        $action = $isNew ? 'CREATED' : 'UPDATED';
+        $this->log("{$table} {$action}: ID={$id}, name=" . ($data['name'] ?? 'N/A') . ", size={$filesize} bytes", 'info');
+
+        return $id;
+    }
+
+    /**
+     * Сохранение без валидации (для обратной совместимости и служебных операций)
+     */
+    public function saveWithoutValidation($table, $data, $id = null) {
+        // Временно удаляем схему
+        $originalSchema = null;
+        if (isset($this->schemas[$table])) {
+            $originalSchema = $this->schemas[$table];
+            unset($this->schemas[$table]);
+        }
+
+        try {
+            $result = $this->save($table, $data, $id);
+
+            // Восстанавливаем схему
+            if ($originalSchema !== null) {
+                $this->schemas[$table] = $originalSchema;
+            }
+
+            return $result;
+        } catch (Exception $e) {
+            // Восстанавливаем схему даже при ошибке
+            if ($originalSchema !== null) {
+                $this->schemas[$table] = $originalSchema;
+            }
+            throw $e;
+        }
+    }
+
+    /**
+     * Поиск записи по ID
+     */
+    public function find($table, $id) {
+        $filePath = $this->dataPath . $table . '/' . $id . '.json';
+
+        if (!file_exists($filePath)) {
+            return null;
+        }
+
+        $content = @file_get_contents($filePath);
+        if ($content === false) {
+            $this->log("Failed to read file: {$filePath}", 'warning');
+            return null;
+        }
+
+        $data = json_decode($content, true);
+
+        if ($data === null && json_last_error() !== JSON_ERROR_NONE) {
+            $this->log("Failed to decode JSON in file: {$filePath}", 'error');
+            return null;
+        }
+
+        return $data;
+    }
+
+    /**
+     * Алиас для find() - для совместимости
+     */
+    public function findById($table, $id) {
+        return $this->find($table, $id);
+    }
+
+    /**
+     * Получение всех записей с фильтрацией
+     */
+    public function findAll($table, $filter = [], $limit = null, $offset = 0) {
+        $cacheKey = $table . '_all';
+
+        // Используем кэш только если нет фильтров
+        if (empty($filter) && isset($this->cache[$cacheKey])) {
+            $results = $this->cache[$cacheKey];
+        } else {
+            // Читаем все файлы из директории
+            $results = [];
+            $dir = $this->dataPath . $table . '/';
+
+            if (!is_dir($dir)) {
+                return [];
+            }
+
+            $files = glob($dir . '*.json');
+
+            if ($files === false) {
+                return [];
+            }
+
+            foreach ($files as $file) {
+                // Пропускаем файл индекса
+                if (basename($file) === 'index.json') {
+                    continue;
+                }
+
+                $content = @file_get_contents($file);
+                if ($content === false) {
+                    continue;
+                }
+
+                $data = json_decode($content, true);
+
+                if ($data === null || !is_array($data)) {
+                    continue;
+                }
+
+                // Проверяем фильтр
+                if (empty($filter) || $this->matchesFilter($data, $filter)) {
+                    $results[] = $data;
+                }
+            }
+
+            // ✅ ИСПРАВЛЕНО: Безопасная сортировка по ID
+            usort($results, function($a, $b) {
+                $aId = $this->toInt($a['id'] ?? 0);
+                $bId = $this->toInt($b['id'] ?? 0);
+                return $aId - $bId;
+            });
+
+            // Сохраняем в кэш если нет фильтров
+            if (empty($filter)) {
+                $this->cache[$cacheKey] = $results;
+            }
+        }
+
+        // Применяем limit и offset
+        if ($limit !== null) {
+            $results = array_slice($results, $offset, $limit);
+        } elseif ($offset > 0) {
+            $results = array_slice($results, $offset);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Найти одну запись по условию
+     */
+    public function findOne($table, $filter) {
+        $results = $this->findAll($table, $filter, 1);
+        return !empty($results) ? $results[0] : null;
+    }
+
+    /**
+     * Найти запись по полю
+     */
+    public function findBy($table, $field, $value) {
+        return $this->findOne($table, [$field => $value]);
+    }
+
+    /**
+     * Создать запись (алиас save)
+     */
+    public function create($table, $data) {
+        return $this->save($table, $data);
+    }
+
+    /**
+     * Обновить запись
+     */
+    public function update($table, $id, $data) {
+        return $this->save($table, $data, $id);
+    }
+
+    /**
+     * Удаление записи
+     */
+    public function delete($table, $id) {
+        $filePath = $this->dataPath . $table . '/' . $id . '.json';
+
+        if (!file_exists($filePath)) {
+            return false;
+        }
+
+        if (@unlink($filePath)) {
+            $this->removeFromIndex($table, $id);
+            unset($this->cache[$table . '_all']);
+            $this->log("Deleted from {$table}: ID={$id}", 'info');
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Удалить записи по условию
+     */
+    public function deleteWhere($table, $filters) {
+        $items = $this->findAll($table, $filters);
+        $deleted = 0;
+
+        foreach ($items as $item) {
+            if (isset($item['id']) && $this->delete($table, $item['id'])) {
+                $deleted++;
+            }
+        }
+
+        return $deleted;
+    }
+
+    /**
+     * Генерация нового ID - ✅ ИСПРАВЛЕНО
+     */
+    private function generateId($table) {
+        $dir = $this->dataPath . $table . '/';
+
+        if (!is_dir($dir)) {
+            return 1;
+        }
+
+        $files = glob($dir . '*.json');
+
+        if ($files === false || empty($files)) {
+            return 1;
+        }
+
+        $maxId = 0;
+
+        foreach ($files as $file) {
+            if (basename($file) === 'index.json') {
+                continue;
+            }
+
+            $content = @file_get_contents($file);
+            if ($content === false) {
+                continue;
+            }
+
+            $data = json_decode($content, true);
+
+            if ($data && isset($data['id'])) {
+                // ✅ ИСПРАВЛЕНО: Безопасное преобразование в int
+                $currentId = $this->toInt($data['id']);
+                if ($currentId > $maxId) {
+                    $maxId = $currentId;
+                }
+            }
+        }
+
+        return $maxId + 1;
+    }
+
+    /**
+     * Обновление индекса
+     */
+    private function updateIndex($table, $id, $data) {
+        $indexPath = $this->dataPath . $table . '/index.json';
+        $index = $this->getIndex($table);
+
+        // Базовые поля для всех таблиц
+        $indexEntry = [
+            'id' => $id,
+            'name' => $data['name'] ?? $data['title'] ?? '',
+            'status' => $data['status'] ?? 'active',
+            'created_at' => $data['created_at'],
+            'updated_at' => $data['updated_at']
+        ];
+
+        // Дополнительные поля для товаров
+        if ($table === 'products') {
+            $indexEntry['price'] = $this->toFloat($data['price'] ?? 0);
+            $indexEntry['category_id'] = $data['category_id'] ?? null;
+            $indexEntry['external_id'] = $data['external_id'] ?? '';
+            $indexEntry['sku'] = $data['sku'] ?? '';
+            $indexEntry['is_new'] = $data['is_new'] ?? false;
+            $indexEntry['stock'] = $this->toInt($data['stock'] ?? 0);
+        }
+
+        // Дополнительные поля для слотов
+        if ($table === 'delivery_slots') {
+            $indexEntry['date'] = $data['date'] ?? null;
+            $indexEntry['time'] = $data['time'] ?? null;
+            $indexEntry['type'] = $data['type'] ?? 'delivery';
+            $indexEntry['capacity'] = $this->toInt($data['capacity'] ?? 10);
+            $indexEntry['booked_count'] = $this->toInt($data['booked_count'] ?? 0);
+        }
+
+        // Дополнительные поля для заказов
+        if ($table === 'orders') {
+            $indexEntry['order_number'] = $data['order_number'] ?? '';
+            $indexEntry['customer_id'] = $data['customer_id'] ?? null;
+            $indexEntry['total'] = $this->toFloat($data['total'] ?? 0);
+            $indexEntry['payment_status'] = $data['payment_status'] ?? 'pending';
+            $indexEntry['payment_method'] = $data['payment_method'] ?? 'cash';
+            $indexEntry['delivery_type'] = $data['delivery_type'] ?? 'delivery';
+        }
+
+        // Дополнительные поля для клиентов
+        if ($table === 'customers') {
+            $indexEntry['email'] = $data['email'] ?? '';
+            $indexEntry['phone'] = $data['phone'] ?? '';
+            $indexEntry['external_id'] = $data['external_id'] ?? '';
+            $indexEntry['bonus_balance'] = $this->toFloat($data['bonus_balance'] ?? 0);
+        }
+
+        // Дополнительные поля для зон доставки
+        if ($table === 'delivery_zones') {
+            $indexEntry['cost'] = $this->toFloat($data['cost'] ?? 0);
+            $indexEntry['delivery_cost'] = $this->toFloat($data['delivery_cost'] ?? 0);
+            $indexEntry['min_order'] = $this->toFloat($data['min_order'] ?? 0);
+            $indexEntry['delivery_time'] = $data['delivery_time'] ?? '';
+            $indexEntry['external_id'] = $data['external_id'] ?? '';
+        }
+
+        // Дополнительные поля для настроек платежей
+        if ($table === 'payment_settings') {
+            $indexEntry['provider'] = $data['provider'] ?? '';
+            $indexEntry['is_active'] = $data['is_active'] ?? 0;
+            $indexEntry['shop_id'] = $data['shop_id'] ?? '';
+            $indexEntry['username'] = $data['username'] ?? '';
+        }
+
+        // Дополнительные поля для транзакций
+        if ($table === 'payment_transactions') {
+            $indexEntry['order_id'] = $data['order_id'] ?? null;
+            $indexEntry['amount'] = $this->toFloat($data['amount'] ?? 0);
+            $indexEntry['provider'] = $data['provider'] ?? '';
+            $indexEntry['transaction_id'] = $data['transaction_id'] ?? '';
+            $indexEntry['payment_status'] = $data['payment_status'] ?? 'pending';
+        }
+
+        // Дополнительные поля для настроек
+        if ($table === 'settings') {
+            $indexEntry['site_logo'] = $data['site_logo'] ?? '';
+            $indexEntry['hero_image'] = $data['hero_image'] ?? '';
+        }
+
+        $index[$id] = $indexEntry;
+
+        @file_put_contents($indexPath, json_encode($index, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+
+    /**
+     * Получение индекса
+     */
+    private function getIndex($table) {
+        $indexPath = $this->dataPath . $table . '/index.json';
+
+        if (!file_exists($indexPath)) {
+            return [];
+        }
+
+        $content = @file_get_contents($indexPath);
+        if ($content === false) {
+            return [];
+        }
+
+        $index = json_decode($content, true);
+
+        return is_array($index) ? $index : [];
+    }
+
+    /**
+     * Удаление из индекса
+     */
+    private function removeFromIndex($table, $id) {
+        $indexPath = $this->dataPath . $table . '/index.json';
+        $index = $this->getIndex($table);
+        unset($index[$id]);
+        @file_put_contents($indexPath, json_encode($index, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+
+    /**
+     * Проверка соответствия фильтру
+     */
+    private function matchesFilter($item, $filter) {
+        foreach ($filter as $key => $value) {
+            if (!isset($item[$key]) || $item[$key] != $value) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Пересоздание индекса из существующих файлов
+     */
+    public function rebuildIndex($table) {
+        $this->log("Rebuilding index for table: {$table}", 'info');
+
+        $dir = $this->dataPath . $table . '/';
+
+        if (!is_dir($dir)) {
+            $this->log("Directory does not exist: {$dir}", 'warning');
+            return false;
+        }
+
+        $files = glob($dir . '*.json');
+
+        if ($files === false) {
+            $this->log("Failed to read directory: {$dir}", 'error');
+            return false;
+        }
+
+        // Очищаем индекс
+        $indexPath = $dir . 'index.json';
+        @file_put_contents($indexPath, json_encode([], JSON_PRETTY_PRINT), LOCK_EX);
+
+        $count = 0;
+        foreach ($files as $file) {
+            if (basename($file) === 'index.json') {
+                continue;
+            }
+
+            $content = @file_get_contents($file);
+            if ($content === false) {
+                continue;
+            }
+
+            $data = json_decode($content, true);
+
+            if ($data && isset($data['id'])) {
+                $this->updateIndex($table, $data['id'], $data);
+                $count++;
+            }
+        }
+
+        unset($this->cache[$table . '_all']);
+        $this->log("Index rebuilt for table: {$table}, entries: {$count}", 'info');
+
+        return true;
+    }
+
+    /**
+     * Получение статистики таблицы
+     */
+    public function getTableStats($table) {
+        $dir = $this->dataPath . $table . '/';
+        $stats = [
+            'total_files' => 0,
+            'total_items' => 0,
+            'index_items' => 0,
+            'index_exists' => false,
+            'directory_writable' => false,
+            'directory_exists' => false
+        ];
+
+        if (!is_dir($dir)) {
+            return $stats;
+        }
+
+        $stats['directory_exists'] = true;
+        $stats['directory_writable'] = is_writable($dir);
+
+        $files = glob($dir . '*.json');
+
+        if ($files === false) {
+            return $stats;
+        }
+
+        $stats['total_files'] = count($files);
+
+        foreach ($files as $file) {
+            if (basename($file) === 'index.json') {
+                $stats['index_exists'] = true;
+                $index = json_decode(@file_get_contents($file), true);
+                $stats['index_items'] = count($index ?: []);
+            } else {
+                $stats['total_items']++;
+            }
+        }
+
+        return $stats;
+    }
+
+    /**
+     * Очистка таблицы
+     */
+    public function truncate($table) {
+        $dir = $this->dataPath . $table . '/';
+
+        if (!is_dir($dir)) {
+            return true;
+        }
+
+        $files = glob($dir . '*.json');
+
+        if ($files !== false) {
+            foreach ($files as $file) {
+                @unlink($file);
+            }
+        }
+
+        unset($this->cache[$table . '_all']);
+        $this->log("Table {$table} truncated", 'info');
+
+        return true;
+    }
+
+    /**
+     * Подсчет записей
+     */
+    public function count($table, $filter = []) {
+        return count($this->findAll($table, $filter));
+    }
+
+    /**
+     * Проверка существования записи
+     */
+    public function exists($table, $id = null) {
+        if ($id === null) {
+            // Проверяем существование таблицы
+            return is_dir($this->dataPath . $table);
+        }
+
+        // Проверяем существование записи
+        $filePath = $this->dataPath . $table . '/' . $id . '.json';
+        return file_exists($filePath);
+    }
+
+    /**
+     * Получить первую запись
+     */
+    public function first($table, $filters = []) {
+        return $this->findOne($table, $filters);
+    }
+
+    /**
+     * Получить последнюю запись
+     */
+    public function last($table, $filters = []) {
+        $results = $this->findAll($table, $filters);
+        return !empty($results) ? end($results) : null;
+    }
+
+    /**
+     * Пагинация записей
+     */
+    public function paginate($table, $page = 1, $perPage = 20, $filters = []) {
+        $allData = $this->findAll($table, $filters);
+        $total = count($allData);
+        $totalPages = ceil($total / $perPage);
+        $offset = ($page - 1) * $perPage;
+
+        $data = array_slice($allData, $offset, $perPage);
+
+        return [
+            'data' => $data,
+            'total' => $total,
+            'per_page' => $perPage,
+            'current_page' => $page,
+            'total_pages' => $totalPages,
+            'from' => $offset + 1,
+            'to' => min($offset + $perPage, $total)
+        ];
+    }
+
+    /**
+     * Сортировка записей - ✅ ИСПРАВЛЕНО
+     */
+    public function orderBy($table, $field, $direction = 'ASC', $filters = []) {
+        $data = $this->findAll($table, $filters);
+
+        usort($data, function($a, $b) use ($field, $direction) {
+            $aVal = $a[$field] ?? null;
+            $bVal = $b[$field] ?? null;
+
+            // ✅ Безопасное сравнение
+            if (is_numeric($aVal) && is_numeric($bVal)) {
+                $aVal = $this->toFloat($aVal);
+                $bVal = $this->toFloat($bVal);
+            }
+
+            if ($aVal === $bVal) return 0;
+
+            $result = $aVal < $bVal ? -1 : 1;
+
+            return strtoupper($direction) === 'DESC' ? -$result : $result;
+        });
+
+        return $data;
+    }
+
+    /**
+     * Поиск по нескольким полям
+     */
+    public function search($table, $query, $fields = []) {
+        $data = $this->findAll($table);
+        $query = mb_strtolower($query, 'UTF-8');
+
+        return array_filter($data, function($item) use ($query, $fields) {
+            foreach ($fields as $field) {
+                if (isset($item[$field])) {
+                    $value = mb_strtolower($item[$field], 'UTF-8');
+                    if (strpos($value, $query) !== false) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        });
+    }
+
+    /**
+     * Получить уникальные значения поля
+     */
+    public function pluck($table, $field, $filters = []) {
+        $data = $this->findAll($table, $filters);
+        $values = array_column($data, $field);
+        return array_unique($values);
+    }
+
+    /**
+     * Подсчёт по группировке
+     */
+    public function groupBy($table, $field, $filters = []) {
+        $data = $this->findAll($table, $filters);
+        $grouped = [];
+
+        foreach ($data as $item) {
+            $key = $item[$field] ?? 'null';
+            if (!isset($grouped[$key])) {
+                $grouped[$key] = 0;
+            }
+            $grouped[$key]++;
+        }
+
+        return $grouped;
+    }
+
+    /**
+     * Создать резервную копию таблицы
+     */
+    public function backup($table) {
+        $sourceDir = $this->dataPath . $table . '/';
+
+        if (!is_dir($sourceDir)) {
+            return false;
+        }
+
+        $backupDir = $this->dataPath . 'backups/' . $table . '/';
+        if (!is_dir($backupDir)) {
+            mkdir($backupDir, 0777, true);
+        }
+
+        $backupPath = $backupDir . date('Y-m-d_H-i-s') . '/';
+        mkdir($backupPath, 0777, true);
+
+        $files = glob($sourceDir . '*.json');
+        $copied = 0;
+
+        foreach ($files as $file) {
+            if (copy($file, $backupPath . basename($file))) {
+                $copied++;
+            }
+        }
+
+        $this->log("Backed up {$table}: {$copied} files", 'info');
+
+        return $backupPath;
+    }
+
+    /**
+     * Восстановить из резервной копии
+     */
+    public function restore($table, $backupPath) {
+        if (!is_dir($backupPath)) {
+            $this->log("Backup path not found: {$backupPath}", 'error');
+            return false;
+        }
+
+        $targetDir = $this->dataPath . $table . '/';
+
+        // Очищаем текущие данные
+        $this->truncate($table);
+
+        // Копируем из backup
+        $files = glob($backupPath . '*.json');
+        $restored = 0;
+
+        foreach ($files as $file) {
+            if (copy($file, $targetDir . basename($file))) {
+                $restored++;
+            }
+        }
+
+        // Очищаем кэш
+        unset($this->cache[$table . '_all']);
+
+        $this->log("Restored {$table}: {$restored} files from {$backupPath}", 'info');
+
+        return $restored;
+    }
+
+    /**
+     * Получить список всех таблиц
+     */
+    public function getTables() {
+        $dirs = glob($this->dataPath . '*', GLOB_ONLYDIR);
+        $tables = [];
+
+        foreach ($dirs as $dir) {
+            $name = basename($dir);
+            if (!in_array($name, ['logs', 'backups', '1c_exchange', 'exports', 'locks'])) {
+                $tables[] = $name;
+            }
+        }
+
+        return $tables;
+    }
+
+    /**
+     * Получить информацию о таблице
+     */
+    public function getTableInfo($table) {
+        $dir = $this->dataPath . $table . '/';
+
+        if (!is_dir($dir)) {
+            return null;
+        }
+
+        $files = glob($dir . '*.json');
+        $count = 0;
+        $size = 0;
+
+        foreach ($files as $file) {
+            if (basename($file) !== 'index.json') {
+                $count++;
+                $size += filesize($file);
+            }
+        }
+
+        return [
+            'name' => $table,
+            'path' => $dir,
+            'records' => $count,
+            'size' => $size,
+            'size_formatted' => $this->formatBytes($size),
+            'modified' => is_file($dir . 'index.json') ? date('Y-m-d H:i:s', filemtime($dir . 'index.json')) : null
+        ];
+    }
+
+    /**
+     * Форматирование размера файла
+     */
+    private function formatBytes($bytes) {
+        $units = ['B', 'KB', 'MB', 'GB'];
+        $i = 0;
+
+        while ($bytes >= 1024 && $i < count($units) - 1) {
+            $bytes /= 1024;
+            $i++;
+        }
+
+        return round($bytes, 2) . ' ' . $units[$i];
+    }
+
+    /**
+     * Получить статистику базы данных
+     */
+    public function getStats() {
+        $stats = [
+            'tables' => [],
+            'total_records' => 0,
+            'total_size' => 0
+        ];
+
+        foreach ($this->getTables() as $table) {
+            $info = $this->getTableInfo($table);
+            if ($info) {
+                $stats['tables'][$table] = $info;
+                $stats['total_records'] += $info['records'];
+                $stats['total_size'] += $info['size'];
+            }
+        }
+
+        $stats['total_size_formatted'] = $this->formatBytes($stats['total_size']);
+
+        return $stats;
+    }
+
+    // ============= МЕТОДЫ ДЛЯ 1С ИНТЕГРАЦИИ (СОХРАНЕНЫ БЕЗ ИЗМЕНЕНИЙ) =============
+
+    /**
+     * Сохранить данные от 1С
+     * ✅ Правильный путь: api/1c-integration.php
+     */
+    public function save1CData($type, $data) {
+        $filePath = $this->dataPath . '1c_exchange/' . $type . '_' . date('Y-m-d_H-i-s') . '.json';
+        @file_put_contents($filePath, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+        $this->log("1C data saved: {$type} via api/1c-integration.php", 'info');
+        return $filePath;
+    }
+
+    /**
+     * Экспорт заказа для 1С
+     * ✅ Используется в api/1c-integration.php
+     */
+    public function export1COrder($orderId) {
+        $order = $this->find('orders', $orderId);
+
+        if (!$order) {
+            $this->log("1C Export: Order not found: {$orderId}", 'error');
+            return false;
+        }
+
+        // Формируем данные для 1С
+        $export = [
+            'order_id' => $order['id'],
+            'order_number' => $order['order_number'],
+            'created_at' => $order['created_at'],
+            'customer' => [
+                'id' => $order['customer_id'] ?? null,
+                'name' => $order['customer_name'] ?? '',
+                'phone' => $order['customer_phone'] ?? '',
+                'email' => $order['customer_email'] ?? ''
+            ],
+            'delivery' => [
+                'type' => $order['delivery_type'] ?? 'delivery',
+                'address' => $order['delivery_address'] ?? '',
+                'date' => $order['delivery_date'] ?? '',
+                'time' => $order['delivery_time'] ?? '',
+                'cost' => $order['delivery_cost'] ?? 0
+            ],
+            'items' => $order['items'] ?? [],
+            'payment' => [
+                'method' => $order['payment_method'] ?? 'cash',
+                'status' => $order['payment_status'] ?? 'pending',
+                'amount' => $order['total'] ?? 0
+            ],
+            'amounts' => [
+                'subtotal' => $order['subtotal'] ?? 0,
+                'delivery' => $order['delivery_cost'] ?? 0,
+                'discount' => $order['discount'] ?? 0,
+                'total' => $order['total'] ?? 0
+            ],
+            'comment' => $order['comment'] ?? '',
+            'status' => $order['status'] ?? 'new',
+            'exported_via' => 'api/1c-integration.php',
+            'export_version' => '4.1'
+        ];
+
+        // Сохраняем в exports/1c/orders
+        $exportPath = $this->dataPath . 'exports/1c/orders/order_' . $order['order_number'] . '_' . date('Y-m-d_H-i-s') . '.json';
+        $result = @file_put_contents($exportPath, json_encode($export, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), LOCK_EX);
+
+        if ($result !== false) {
+            // Обновляем статус экспорта в заказе
+            $order['sync_1c'] = true;
+            $order['sync_1c_at'] = date('Y-m-d H:i:s');
+            $order['sync_1c_version'] = '4.1';
+            $this->saveWithoutValidation('orders', $order, $orderId); // Используем без валидации для служебных полей
+
+            $this->log("Order #{$order['order_number']} exported to 1C via api/1c-integration.php: {$exportPath}", 'info');
+            return $exportPath;
+        }
+
+        $this->log("1C Export failed for order #{$order['order_number']}", 'error');
+        return false;
+    }
+
+    /**
+     * Получить файлы обмена 1С
+     * ✅ Используется в api/1c-integration.php
+     */
+    public function get1CFiles($type = null) {
+        $dir = $this->dataPath . '1c_exchange/';
+        $files = @scandir($dir);
+        $result = [];
+
+        if ($files === false) {
+            $this->log("1C: Cannot read exchange directory", 'error');
+            return $result;
+        }
+
+        foreach ($files as $file) {
+            if ($file != '.' && $file != '..' && is_file($dir . $file)) {
+                if ($type === null || strpos($file, $type) === 0) {
+                    $result[] = [
+                        'name' => $file,
+                        'path' => $dir . $file,
+                        'size' => filesize($dir . $file),
+                        'modified' => filemtime($dir . $file),
+                        'api_endpoint' => 'api/1c-integration.php'
+                    ];
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Получить экспортированные заказы для 1С
+     * ✅ Используется в api/1c-integration.php для отправки в 1С
+     */
+    public function get1CExportedOrders($limit = 50) {
+        $dir = $this->dataPath . 'exports/1c/orders/';
+
+        if (!is_dir($dir)) {
+            $this->log("1C: Export directory not found", 'warning');
+            return [];
+        }
+
+        $files = glob($dir . 'order_*.json');
+
+        if ($files === false) {
+            return [];
+        }
+
+        // Сортируем по времени изменения (новые первыми)
+        usort($files, function($a, $b) {
+            return filemtime($b) - filemtime($a);
+        });
+
+        $result = [];
+        $count = 0;
+
+        foreach ($files as $file) {
+            if ($count >= $limit) {
+                break;
+            }
+
+            $content = @file_get_contents($file);
+            if ($content !== false) {
+                $data = json_decode($content, true);
+                if ($data) {
+                    $result[] = [
+                        'file' => basename($file),
+                        'path' => $file,
+                        'data' => $data,
+                        'exported_at' => date('Y-m-d H:i:s', filemtime($file)),
+                        'api_endpoint' => 'api/1c-integration.php'
+                    ];
+                    $count++;
+                }
+            }
+        }
+
+        $this->log("1C: Retrieved {$count} exported orders for sync via api/1c-integration.php", 'info');
+        return $result;
+    }
+
+    /**
+     * Обновить время последней синхронизации 1С
+     * ✅ Вызывается из api/1c-integration.php после успешной синхронизации
+     */
+    public function update1CSyncTime() {
+        $settings = $this->find('settings', 'main');
+        if ($settings) {
+            if (!isset($settings['1c_integration'])) {
+                $settings['1c_integration'] = [];
+            }
+            $settings['1c_integration']['last_sync'] = date('Y-m-d H:i:s');
+            $settings['1c_integration']['api_endpoint'] = 'api/1c-integration.php';
+            $settings['1c_integration']['version'] = '4.1';
+            $this->saveWithoutValidation('settings', $settings, 'main'); // Без валидации для служебных операций
+            $this->log("1C sync time updated via api/1c-integration.php", 'info');
+        }
+    }
+
+    /**
+     * Получить статус последней синхронизации 1С
+     * ✅ Используется в api/1c-integration.php для мониторинга
+     */
+    public function get1CSyncStatus() {
+        $settings = $this->find('settings', 'main');
+        if ($settings && isset($settings['1c_integration']['last_sync'])) {
+            $lastSync = strtotime($settings['1c_integration']['last_sync']);
+            $now = time();
+            $diff = $now - $lastSync;
+
+            return [
+                'last_sync' => $settings['1c_integration']['last_sync'],
+                'seconds_ago' => $diff,
+                'minutes_ago' => round($diff / 60),
+                'status' => $diff < 600 ? 'recent' : ($diff < 3600 ? 'normal' : 'outdated'),
+                'api_endpoint' => 'api/1c-integration.php',
+                'version' => $settings['1c_integration']['version'] ?? 'unknown'
+            ];
+        }
+
+        return [
+            'last_sync' => null,
+            'status' => 'never',
+            'api_endpoint' => 'api/1c-integration.php',
+            'message' => 'Sync never performed'
+        ];
+    }
+
+    /**
+     * Импорт товаров из 1С
+     * ✅ Используется в api/1c-integration.php при получении каталога
+     */
+    public function import1CProducts($products) {
+        $imported = 0;
+        $updated = 0;
+        $errors = [];
+
+        foreach ($products as $productData) {
+            try {
+                $externalId = $productData['external_id'] ?? null;
+
+                if (!$externalId) {
+                    $errors[] = "Product without external_id: " . json_encode($productData);
+                    continue;
+                }
+
+                // Ищем существующий товар по external_id
+                $existing = $this->findBy('products', 'external_id', $externalId);
+
+                if ($existing) {
+                    // Обновляем существующий
+                    $productData['id'] = $existing['id'];
+                    $this->saveWithoutValidation('products', $productData, $existing['id']);
+                    $updated++;
+                } else {
+                    // Создаем новый
+                    $this->saveWithoutValidation('products', $productData);
+                    $imported++;
+                }
+            } catch (Exception $e) {
+                $errors[] = "Error importing product: " . $e->getMessage();
+            }
+        }
+
+        $this->log("1C Products imported: {$imported} new, {$updated} updated, " . count($errors) . " errors via api/1c-integration.php", 'info');
+
+        return [
+            'imported' => $imported,
+            'updated' => $updated,
+            'errors' => $errors,
+            'total' => $imported + $updated
+        ];
+    }
+
+    /**
+     * Импорт клиентов из 1С
+     * ✅ Используется в api/1c-integration.php при синхронизации клиентов
+     */
+    public function import1CCustomers($customers) {
+        $imported = 0;
+        $updated = 0;
+        $errors = [];
+
+        foreach ($customers as $customerData) {
+            try {
+                $externalId = $customerData['external_id'] ?? null;
+
+                if (!$externalId) {
+                    $errors[] = "Customer without external_id: " . json_encode($customerData);
+                    continue;
+                }
+
+                // Ищем существующего клиента по external_id
+                $existing = $this->findBy('customers', 'external_id', $externalId);
+
+                if ($existing) {
+                    // Обновляем существующего
+                    $customerData['id'] = $existing['id'];
+                    $this->saveWithoutValidation('customers', $customerData, $existing['id']);
+                    $updated++;
+                } else {
+                    // Создаем нового
+                    $this->saveWithoutValidation('customers', $customerData);
+                    $imported++;
+                }
+            } catch (Exception $e) {
+                $errors[] = "Error importing customer: " . $e->getMessage();
+            }
+        }
+
+        $this->log("1C Customers imported: {$imported} new, {$updated} updated, " . count($errors) . " errors via api/1c-integration.php", 'info');
+
+        return [
+            'imported' => $imported,
+            'updated' => $updated,
+            'errors' => $errors,
+            'total' => $imported + $updated
+        ];
+    }
+
+    /**
+     * Получить настройки интеграции 1С
+     * ✅ Используется в api/1c-integration.php для конфигурации
+     */
+    public function get1CSettings() {
+        $settings = $this->find('settings', 'main');
+
+        $defaults = [
+            'enabled' => false,
+            'api_endpoint' => 'api/1c-integration.php',
+            'api_key' => '',
+            'auto_sync' => true,
+            'sync_interval' => 300, // 5 минут
+            'export_orders' => true,
+            'import_products' => true,
+            'import_customers' => true,
+            'version' => '4.1'
+        ];
+
+        if ($settings && isset($settings['1c_integration'])) {
+            return array_merge($defaults, $settings['1c_integration']);
+        }
+
+        return $defaults;
+    }
+
+    /**
+     * Обновить настройки интеграции 1С
+     * ✅ Используется в api/1c-integration.php для изменения конфигурации
+     */
+    public function update1CSettings($newSettings) {
+        $settings = $this->find('settings', 'main');
+
+        if (!$settings) {
+            $settings = ['id' => 'main'];
+        }
+
+        if (!isset($settings['1c_integration'])) {
+            $settings['1c_integration'] = [];
+        }
+
+        $settings['1c_integration'] = array_merge($settings['1c_integration'], $newSettings);
+        $settings['1c_integration']['api_endpoint'] = 'api/1c-integration.php'; // Всегда правильный путь
+
+        $this->saveWithoutValidation('settings', $settings, 'main');
+        $this->log("1C settings updated via api/1c-integration.php", 'info');
+
+        return true;
+    }
+
+    /**
+     * Логирование
+     */
+    public function log($message, $type = 'info') {
+        $logPath = $this->dataPath . 'logs/' . date('Y-m-d') . '.log';
+        $timestamp = date('Y-m-d H:i:s');
+        $logEntry = "[{$timestamp}] [{$type}] {$message}" . PHP_EOL;
+
+        // Создаем директорию если не существует
+        $logDir = dirname($logPath);
+        if (!is_dir($logDir)) {
+            @mkdir($logDir, 0777, true);
+        }
+
+        @file_put_contents($logPath, $logEntry, FILE_APPEND | LOCK_EX);
+    }
+
+    public function getLogs($date = null) {
+        $date = $date ?? date('Y-m-d');
+        $logPath = $this->dataPath . 'logs/' . $date . '.log';
+
+        if (file_exists($logPath)) {
+            return file($logPath, FILE_IGNORE_NEW_LINES);
+        }
+
+        return [];
+    }
+
+    /**
+     * Очистить старые логи
+     */
+    public function cleanLogs($days = 7) {
+        $logDir = $this->dataPath . 'logs/';
+
+        if (!is_dir($logDir)) {
+            return 0;
+        }
+
+        $files = glob($logDir . '*.log');
+        $deleted = 0;
+        $cutoff = time() - ($days * 86400);
+
+        foreach ($files as $file) {
+            if (filemtime($file) < $cutoff) {
+                if (unlink($file)) {
+                    $deleted++;
+                }
+            }
+        }
+
+        return $deleted;
+    }
+}
+
+// Инициализация базы данных
+$db = new Database();
+
+/**
+ * Инициализация начальных данных
+ */
+function initializeDatabase($db) {
+    // Категории
+    $categories = [
+        ['name' => 'Роллы', 'slug' => 'rolls', 'description' => 'Японские роллы', 'status' => 'active', 'sort_order' => 1],
+        ['name' => 'Суши', 'slug' => 'sushi', 'description' => 'Классические суши', 'status' => 'active', 'sort_order' => 2],
+        ['name' => 'Сашими', 'slug' => 'sashimi', 'description' => 'Свежая рыба без риса', 'status' => 'active', 'sort_order' => 3],
+        ['name' => 'Горячие роллы', 'slug' => 'hot-rolls', 'description' => 'Запеченные роллы', 'status' => 'active', 'sort_order' => 4],
+        ['name' => 'Поке', 'slug' => 'poke', 'description' => 'Гавайские боулы', 'status' => 'active', 'sort_order' => 5],
+        ['name' => 'Сеты', 'slug' => 'sets', 'description' => 'Готовые наборы', 'status' => 'active', 'sort_order' => 6],
+        ['name' => 'Напитки', 'slug' => 'drinks', 'description' => 'Безалкогольные напитки', 'status' => 'active', 'sort_order' => 7]
+    ];
+
+    foreach ($categories as $category) {
+        $db->save('categories', $category);
+    }
+
+    // Настройки платежных систем по умолчанию
+    $paymentSettings = [
+        [
+            'provider' => 'yookassa',
+            'name' => 'ЮKassa',
+            'is_active' => 0,
+            'shop_id' => '',
+            'secret_key' => '',
+            'description' => 'Банковские карты, СБП, электронные кошельки'
+        ],
+        [
+            'provider' => 'sberbank',
+            'name' => 'Сбербанк Онлайн',
+            'is_active' => 0,
+            'username' => '',
+            'password' => '',
+            'description' => 'Безопасная оплата через Сбербанк'
+        ]
+    ];
+
+    foreach ($paymentSettings as $setting) {
+        $db->save('payment_settings', $setting);
+    }
+
+    // Проверяем существование главных настроек и добавляем поля
+    $mainSettings = $db->find('settings', 'main');
+
+    if (!$mainSettings) {
+        // Создаем новые настройки
+        $mainSettings = [
+            'id' => 'main',
+            'site_name' => "Sasha's Sushi",
+            'site_description' => 'Лучшие суши и роллы в городе с доставкой',
+            'site_logo' => '',
+            'hero_image' => '',
+            'phones' => ['+7 999 123-45-67'],
+            'work_hours' => ['start' => '10:00', 'end' => '23:00'],
+            'vk_link' => 'https://vk.com/sasha_s_sushi',
+            'telegram_link' => '',
+            'email' => '',
+            'delivery_cost' => 200,
+            'free_delivery_from' => 999,
+            'min_order_amount' => 800,
+            '1c_integration' => [
+                'enabled' => false,
+                'api_endpoint' => 'api/1c-integration.php',
+                'api_key' => '',
+                'auto_sync' => true,
+                'sync_interval' => 300,
+                'export_orders' => true,
+                'import_products' => true,
+                'import_customers' => true,
+                'version' => '4.1',
+                'last_sync' => null
+            ]
+        ];
+        $db->saveWithoutValidation('settings', $mainSettings, 'main');
+    } else {
+        // Обновляем существующие настройки
+        $updated = false;
+
+        if (!isset($mainSettings['site_logo'])) {
+            $mainSettings['site_logo'] = '';
+            $updated = true;
+        }
+
+        if (!isset($mainSettings['hero_image'])) {
+            $mainSettings['hero_image'] = '';
+            $updated = true;
+        }
+
+        // ✅ Добавляем/обновляем настройки 1С с правильным путем
+        if (!isset($mainSettings['1c_integration'])) {
+            $mainSettings['1c_integration'] = [
+                'enabled' => false,
+                'api_endpoint' => 'api/1c-integration.php',
+                'api_key' => '',
+                'auto_sync' => true,
+                'sync_interval' => 300,
+                'export_orders' => true,
+                'import_products' => true,
+                'import_customers' => true,
+                'version' => '4.1',
+                'last_sync' => null
+            ];
+            $updated = true;
+        } else {
+            // Обновляем путь API если он неправильный
+            if (!isset($mainSettings['1c_integration']['api_endpoint']) || 
+                $mainSettings['1c_integration']['api_endpoint'] !== 'api/1c-integration.php') {
+                $mainSettings['1c_integration']['api_endpoint'] = 'api/1c-integration.php';
+                $mainSettings['1c_integration']['version'] = '4.1';
+                $updated = true;
+            }
+        }
+
+        if ($updated) {
+            $db->saveWithoutValidation('settings', $mainSettings, 'main');
+            $db->log('Updated settings with correct 1C API path: api/1c-integration.php', 'info');
+        }
+    }
+
+    $db->log('Database initialized v4.1 with correct API paths', 'info');
+}
+
+// Проверяем, нужна ли инициализация
+if (empty($db->findAll('categories'))) {
+    initializeDatabase($db);
+} else {
+    // Даже если категории есть, проверяем настройки
+    $mainSettings = $db->find('settings', 'main');
+
+    if ($mainSettings) {
+        $updated = false;
+
+        if (!isset($mainSettings['site_logo']) || !isset($mainSettings['hero_image'])) {
+            if (!isset($mainSettings['site_logo'])) {
+                $mainSettings['site_logo'] = '';
+            }
+            if (!isset($mainSettings['hero_image'])) {
+                $mainSettings['hero_image'] = '';
+            }
+            $updated = true;
+        }
+
+        // ✅ Проверяем и исправляем путь к API 1С
+        if (!isset($mainSettings['1c_integration']['api_endpoint']) || 
+            $mainSettings['1c_integration']['api_endpoint'] !== 'api/1c-integration.php') {
+            if (!isset($mainSettings['1c_integration'])) {
+                $mainSettings['1c_integration'] = [];
+            }
+            $mainSettings['1c_integration']['api_endpoint'] = 'api/1c-integration.php';
+            $mainSettings['1c_integration']['version'] = '4.1';
+            $updated = true;
+        }
+
+        if ($updated) {
+            $db->saveWithoutValidation('settings', $mainSettings, 'main');
+            $db->log('Fixed 1C API path to api/1c-integration.php', 'info');
+        }
+    }
+}
